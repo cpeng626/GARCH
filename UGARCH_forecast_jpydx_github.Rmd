@@ -1,0 +1,701 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+The template of fit, chose, forecast and simulate by applying Univariate GARCH model.
+1. fit, model selection, forecast and simulate.(model selection criterion: Forecasting Error)
+2. result saving and graphs drafting.
+3. forecasting error calculation.
+
+Set working directory 
+```{r}
+setwd("")
+```
+
+Necessary libraries 
+```{r}
+library(readxl)
+library(xtable)
+library(fBasics)
+library(rugarch)
+library(car)
+library(rmgarch)
+library(ggplot2)
+library(xts)
+library(date)
+library(parallel)
+library(forecast)
+library(tseries)
+library(dplyr)
+```
+
+
+Specifiy multiple plot function that operates on ggplot2 graphs
+```{r}
+## From the internet
+## URL https://github.com/mdlincoln/multiplot/blob/master/R/multiplot.R
+multiplot <- function(..., plotlist=NULL, file, cols=1, layout=NULL) {
+  library(grid)
+  
+  # Make a list from the ... arguments and plotlist
+  plots <- c(list(...), plotlist)
+  
+  numPlots = length(plots)
+  
+  # If layout is NULL, then use 'cols' to determine layout
+  if (is.null(layout)) {
+    # Make the panel
+    # ncol: Number of columns of plots
+    # nrow: Number of rows needed, calculated from # of cols
+    layout <- matrix(seq(1, cols * ceiling(numPlots/cols)),
+                     ncol = cols, nrow = ceiling(numPlots/cols))
+  }
+  
+  if (numPlots==1) {
+    print(plots[[1]])
+    
+  } else {
+    # Set up the page
+    grid.newpage()
+    pushViewport(viewport(layout = grid.layout(nrow(layout), ncol(layout))))
+    
+    # Make each plot, in the correct location
+    for (i in 1:numPlots) {
+      # Get the i,j matrix positions of the regions that contain this subplot
+      matchidx <- as.data.frame(which(layout == i, arr.ind = TRUE))
+      
+      print(plots[[i]], vp = viewport(layout.pos.row = matchidx$row,
+                                      layout.pos.col = matchidx$col))
+    }
+  }
+}
+```
+
+
+Importing data
+```{r}
+dj <- as.data.frame(read.csv("JPY.csv"))
+dj1<-as.data.frame(dj[,c(1:2)])
+
+dx<- as.data.frame(read.csv("DX.csv"))
+dx1<-as.data.frame(dx[,c(1:2)])
+#Dx<-as.numeric(dx)
+#Dx_clean<-lapply(Dx, function(x) x[!is.na(x)])
+merged_data<-merge(dj1,dx1, by="Date")
+#Df <- df
+#data$Gold <- tsclean(data[,11])
+```
+
+
+```{r}
+merged_data <- merged_data %>%rename(jpy = Open.x, dx = Open.y)
+  
+merged_data$dx <- as.numeric(merged_data$dx)
+merged_data$jpy <- as.numeric(merged_data$jpy)
+```
+
+```{r}
+find_missing_values <- function(df) {
+  missing_data <- which(is.na(df), arr.ind = TRUE)
+  if (nrow(missing_data) == 0) {
+    cat("No missing values found in the dataframe.\n")
+  } else {
+    cat("\nMissing values percentage per column:\n")
+    missing_percentage <- colMeans(is.na(df)) * 100
+    print(missing_percentage)
+  }
+}
+
+find_missing_values(merged_data)
+```
+```{r}
+cleaned_data <- merged_data[!(is.na(merged_data$jpy) | is.na(merged_data$dx)), ]
+
+find_missing_values(cleaned_data)
+```
+
+
+========================
+Univariate data analysis
+========================
+
+Creates continuous returns time series.
+Notice returns are computed two times and called differently.
+We apologize for the fact but we preferred to keep it like that to facilitate code aggregation.
+```{r}
+## First time
+a <- function(x){
+  diff(log(x), lag = 1, drop=F)
+}
+
+data_returns <- as.data.frame(sapply(cleaned_data[,-1], FUN= a))
+
+## Second time
+Returns <- as.data.frame(sapply(cleaned_data[,2:ncol(cleaned_data)], function(cleaned_data) diff(log(cleaned_data))))
+
+' Adding Date column to Log-returns dataframe'
+
+Returns_Date <- as.data.frame(cleaned_data[-1,1])
+colnames(Returns_Date) <- "Date"
+Returns <- cbind.data.frame(Returns_Date,Returns)
+```
+
+```{r}
+Returns$Date <- as.POSIXct(Returns$Date, format = "%Y-%m-%d",tz="UTC")
+cleaned_data$Date<-as.POSIXct(cleaned_data$Date, format = "%Y-%m-%d",tz="UTC")
+```
+
+Calculate squared returns
+```{r}
+sq_returns <- cbind.data.frame(Returns_Date ,data_returns^2)
+```
+
+
+
+Plot return series
+```{r}
+simple_plot <- list()  
+for (i in 1:3)
+  local({
+    i <- i
+    plot <- ggplot(Returns, aes(Returns[,1], Returns[,i+1])) +
+    geom_line(aes(y= Returns[,i+1]), colour= "blue") +
+    xlab("Date") + ylab("Return")+ ggtitle(colnames(Returns)[i+1])+ 
+    theme_bw()
+    simple_plot[[i]] <<- plot
+})
+
+## Decide which ones to plot
+multiplot(plotlist = simple_plot[c(1,2)], cols =1)
+
+```
+Plot return series
+```{r}
+data<-cleaned_data
+simple_plot <- list()  
+for (i in 1:3)
+  local({
+    i <- i
+    plot <- ggplot(data, aes(data[,1], data[,i+1])) +
+    geom_line(aes(y= data[,i+1]), colour= "blue") +
+    xlab("Date") + ylab("Price")+ ggtitle(colnames(data)[i+1])+ 
+    theme_bw()
+    simple_plot[[i]] <<- plot
+})
+
+## Decide which ones to plot
+multiplot(plotlist = simple_plot[c(1,2)], cols =1)
+
+```
+
+
+
+Restrict data.frame to selected index: SP500, Corn, Crude Oil, Heating Oil
+```{r}
+
+data_returns <- Returns[,c(1,2,3)]
+data_returns<-data_returns[, -1]
+```
+
+Check stationarity of the series after 1st difference
+```{r}
+adf <-  function(dat) adf.test(dat,alternative="stationary")
+
+suppressWarnings(sapply(data_returns[-1,], adf))
+```
+
+
+Check simple statistics at the return level. Especially Skewness and Kurtosis might be interesting.
+```{r}
+options(xtable.floating = FALSE)
+options(xtable.timestamp = "")
+bb <- basicStats(data_returns[-1, ], ci=0.95)
+bb[13:16,]
+```
+
+
+Jaque_bera
+```{r}
+sapply(data_returns[-1, ], jarqueberaTest)
+```
+
+Empirical vs Normal densities
+```{r}
+
+normal_VS_empirical <- function(dat, indx){
+  d<- density(dat) # returns the density data
+  plot(d, xlab = "Returns", lty ="dotted",col="red", lwd =3,
+       main = paste("Kernel vs. Normal", colnames(data_returns[indx])))
+  xfit<-seq(min(dat),max(dat),length=100) 
+  yfit<-dnorm(xfit,mean=mean(dat),sd=sd(dat)) 
+  lines(xfit, yfit, col="blue", lwd=2)
+  legend("topright", legend=c("empirical", "normal"),
+       col=c("red", "blue"), lty="dotted", cex=0.3)
+}
+
+par(mfrow=c(1,1))
+for(i in 1:length(data_returns)){
+  normal_VS_empirical(data_returns[,i], i)
+}
+
+```
+
+
+Qualitative plots
+```{r}
+par(mfrow=c(2,2))
+for(i in 1:length(data_returns)) {
+  acf(data_returns[,i], main = paste( "ACF", colnames(data_returns[i])))
+  pacf(data_returns[,i], main = paste("PACF", colnames(data_returns[i])))
+}
+```
+
+
+```{r}
+par(mfrow=c(2,2))
+for(i in 1:length(data_returns)) {
+  acf(data_returns[,i]^2, main = paste( "ACF Squared", colnames(data_returns[i])))
+  pacf(data_returns[,i]^2, main = paste("PACF Squared", colnames(data_returns[i])))
+}
+```
+
+
+==================================================
+Quantitative Statistics that tests for Random Walk
+==================================================
+
+Simple Box-Liung
+```{r}
+fux <- function(dat, lag){
+  Box.test(dat,lag= lag ,type="Ljung")
+}
+sapply(data_returns, lag= 20, fux) ## use xtable to get latex output if interested
+```
+
+===
+Test presence of ARCH effects
+===
+
+Specify Lagrange Multiplier test
+```{r}
+LM=function(x,h)
+{
+  n=length(x)
+  x2=x^2-mean(x^2)
+  dat<-matrix(,n-h,h+1)
+  for (i in 1:(h+1))
+  {
+    dat[,i]=x2[(h+2-i):(n-i+1)]
+  }
+  a=lm(dat[,1]~dat[,2:(h+1)])
+  r2=summary(a)$r.squared
+  pvalue=1-pchisq(r2*n,h)
+  print(paste("Chi-square:", r2 * n))
+  print(paste("p-value:", pvalue))
+}
+```
+
+```{r}
+for(i in 1:length(data_returns)){
+  LM(data_returns[,i], 20)
+}
+```
+
+```{r}
+for(i in 1:length(data_returns)){
+  print(Box.test(data_returns[,i]^2, 20, type="Ljung"))
+}
+```
+
+
+
+To check for autocorrelation at returns level assuming normal GARCH
+```{r}
+gamma=function(x,h)
+{
+  n=length(x)
+  h=abs(h)
+  x=x-mean(x)
+  gamma=sum(x[1:(n-h)]*x[(h+1):n])/n
+}
+
+rho=function(x,h)
+{
+  rho=gamma(x,h)/gamma(x,0)
+}
+
+n1.acf=function(x, main, method="NP")
+{
+  n=length(x)
+  nlag=as.integer(min(10*log10(n),n-1))
+  acf.val=sapply(c(1:nlag),function(h) rho(x,h))
+  x2=x^2
+  var= 1+(sapply(c(1:nlag),function(h) gamma(x2,h)))/gamma(x,0)^2
+  band=sqrt(var/n)
+  minval=1.2*min(acf.val,-1.96*band,-1.96/sqrt(n))
+  maxval=1.2*max(acf.val,1.96*band,1.96/sqrt(n))
+  acf(x,xlab="Lag",ylab="Sample autocorrelations",ylim=c(minval,maxval),main=main)
+  lines(c(1:nlag),-1.96*band,lty=5,col="lightblue")
+  lines(c(1:nlag),1.96*band,lty=5,col="lightblue")
+  legend("topright", legend=c("H(0) = i.i.d.", "H(0) = GARCH"),
+       col=c("blue", "lightblue"), lty=c(2, 5), cex=0.4)
+}
+```
+
+Autocorrelations
+```{r}
+par(mfrow=c(1,1))
+for(i in 1:length(data_returns)) {
+  n1.acf(data_returns[,i], colnames(data_returns[i]))
+}
+```
+
+=========
+Fit GARCH 
+=========
+
+```{r}
+specification <- c("sGARCH", "eGARCH", "gjrGARCH", "csGARCH")
+logL <- matrix(0,nrow=length(specification),ncol=length(data_returns))
+params <- matrix(0,nrow=length(specification),ncol=length(data_returns))
+aic <- matrix(0,nrow=length(specification),ncol=length(data_returns))
+bic <- matrix(0,nrow=length(specification),ncol=length(data_returns))
+
+
+modelreport<-list()
+for (q in c(1:length(data_returns))) {
+  for (p in c(1:length(specification))) {
+    spec<- ugarchspec(mean.model=list(armaOrder=c(0,0)),variance.model=list(model = specification[p], garchOrder=c(1,1)), distribution.model='nig')
+    fit<- ugarchfit(spec=spec,data= data_returns[,q], solver = "hybrid",control = list(stationarity = T))
+    fitted<-list(fit)
+    modelreport<-c(modelreport, fitted)
+    logL[p,q] <- likelihood(fit)
+    params[p,q] <- length(coef(fit))
+    aic[p,q] <- infocriteria(fit)[1]
+    bic[p,q] <- infocriteria(fit)[2]
+    text<-paste(colnames(data_returns)[q], specification[p])
+    print(paste("Model is done: ", text))
+  }
+}
+logL
+params
+aic
+bic
+```
+
+
+============================
+List the Parameter of Models 
+============================
+```{r}
+text=list()
+for (q in 1:length(data_returns)) {
+  for (p in 1:length(specification)) {
+  variablemodel<-paste(colnames(data_returns)[q], specification[p])
+  text<-c(text,variablemodel)
+  }
+}
+
+
+parameters<-data.frame(para=c("mu","ar1","ma1","omega","alpha1","beta1", "gamma1","eta11","eta21","skew","shape"))
+for (i in 1:length(modelreport)) {
+  report<-as.data.frame(coef(modelreport[[i]]))
+  colnames(report)<-text[i]
+  report$para<-row.names(report)
+  parameters<-left_join(parameters,report, by="para")
+}
+print(parameters)
+```
+
+
+
+Leverage effect after GARCH
+```{r}
+
+for (i in 1:length(modelreport)) {
+  signbiasreport<-as.data.frame(signbias(modelreport[[i]]))
+  signbiasreport$SeriesSpecification <- NA
+  signbiasreport$SeriesSpecification[1]<- as.character(text[i])
+  print(signbiasreport)
+}  
+```
+
+
+==================
+Fitted evaluation
+==================
+
+====
+Compare sign bias before and after asymmetric effect
+====
+
+Plotnews impact curve for different models
+```{r}
+for(q in 1:length(data_returns)) {
+  par(mfrow=c(2,3))
+  par(oma=c(0,0,2,0))
+  new_imp <- list()
+k<-(q-1)*(length(specification))+1
+m<-length(specification)*q
+for(i in k:m){
+  new_imp[[i]] <- newsimpact(modelreport[[i]])
+  plot(new_imp[[i]]$zx, type="l", lwd=2, col="blue",new_imp[[i]]$zy, ylab=new_imp[[i]]$yexpr, xlab=new_imp[[i]]$xexpr)
+  title(paste(text[i],"(1,1)"))
+  }
+}
+```
+
+
+Show empirical kernel desity vs assumption on standardized residuals
+```{r}
+normal_VS_empirical_resid <- function(dat){
+  d<- density(dat) # returns the density data
+  plot(d, xlab = "Standardized returns", lty ="dotted",col="red", lwd =3, main="")
+  xfit<-seq(min(dat),max(dat),length=100) 
+  yfit<-dnorm(xfit,mean=0,sd=1) ## take 0, 1 as assumed in the estimation
+  lines(xfit, yfit, col="blue", lwd=2)
+  legend("topright", legend=c("empirical", "normal"),
+       col=c("red", "blue"), lty="dotted", cex=0.3)
+}
+
+for(q in 1:length(data_returns)) {
+  par(mfrow=c(2,3))
+  par(oma=c(0,2,0,0))
+  zeta <- matrix(NA, ncol = 20, nrow = NROW(data_returns))
+  
+k<-(q-1)*(length(specification))+1
+m<-length(specification)*q
+for(i in k:m){
+  zeta[,i] <- residuals(modelreport[[i]], standardize=T)
+  normal_VS_empirical_resid(zeta[,i])
+  title(main = "Kernel vs. Normal", sub = paste(text[i], "(1,1)"))
+  }
+}
+
+```
+
+Normality check via QQ-plot
+```{r}
+for(q in 1:length(data_returns)) {
+  par(mfrow=c(2,3))
+  par(oma=c(0,0,2,0))
+  zeta <- matrix(NA, ncol = 20, nrow = NROW(data_returns))
+  k<-(q-1)*(length(specification))+1
+  m<-length(specification)*q
+  for(i in k:m){
+    zeta[,i] <- residuals(modelreport[[i]], standardize=T)
+    qqnorm(zeta[,i], main = ""); qqline(zeta[,i], col ="red")
+    title(text[i])
+  }
+title(paste("QQ-Standardized", colnames(data_returns[q])), font=2 , outer=TRUE)
+}
+```
+
+The gof calculates the chi-squared goodness of fit test, which compares the empirical distribution of the standardized residuals with the theoretical ones from the chosen density
+```{r}
+for (i in 1:length(modelreport)) {
+  print(gof(modelreport[[i]], c(20,30, 50)))
+}  
+```
+
+Standardized and squared standardized ACF
+```{r}
+for (q in 1:length(data_returns)){
+  par(oma=c(0,0,2,0), mar=c(3,2,2,2))
+  par(mfrow=c(2,3))
+  k<-(q-1)*(length(specification))+1
+  m<-length(specification)*q
+for (i in k:m) {
+  plot(modelreport[[i]], which = 10)
+    ##plot(modelreport[[i]], which = 11)
+}
+title (paste("GSCI", colnames(data_returns[q])),font=2 , outer=TRUE)
+}
+```
+
+```{r}
+for (q in c(1:length(data_returns))){
+par(oma=c(0,0,2,0), mar=c(3,2,2,2))
+par(mfrow=c(2,3))
+k<-(q-1)*(length(specification))+1
+m<-length(specification)*q
+for (i in k:m){
+  plot(modelreport[[i]], which = 11)
+}
+title (paste("GSCI", colnames(data_returns[q])),font=2 , outer=TRUE)
+}
+```
+
+
+=============
+Ex post tests
+=============
+
+VaR test
+```{r}
+for (q in 1:length(data_returns)){
+actual = data_returns[,q]
+#vartest<-paste(colnames(data_returns[,q]),colnames(specification[,q]))
+  k<-(q-1)*(length(specification))+1
+  m<-length(specification)*q
+  for(i in k:m) {
+  VaR1= fitted(modelreport[[i]]) + sigma(modelreport[[i]])*qnorm(0.01) ## One sided test
+  print(paste(text[i], "   ", VaRTest(0.01, actual, VaR1, conf.level = 0.99)$expected.exceed))
+  print(paste(text[i], "   ", VaRTest(0.01, actual, VaR1, conf.level = 0.99)$actual.exceed))
+  }  ## maybe integrate with the VARDURtest of the package
+}
+```
+
+VaR test 
+```{r}
+for (q in 1:length(data_returns)) {
+  actual = data_returns[2001:4047,q]
+  for(p in 1: length(specification)){
+  spec_var = ugarchspec(mean.model = list(armaOrder = c(0,1)), variance.model = list(model = specification[p],garchOrder=c(1,1)), distribution.model = "sstd", fixed.pars = list(delta=1))
+  fit_var = ugarchfit(spec_var, data = data_returns[1:2000, q, drop=FALSE])
+  spec2 = spec_var
+  setfixed(spec2)<-as.list(coef(fit_var))
+  filt = ugarchfilter(spec2, data_returns[2001:4047, q, drop=FALSE], n.old = 2000)
+  #actual = data_returns[3001:7112,q]
+# location+scale invariance allows to use [mu + sigma*q(p,0,1,skew,shape)]
+  VaR2 = fitted(filt) + sigma(filt)*qdist("std", p=0.01, mu = 0, sigma = 1, skew  = coef(fit)["skew"], shape=coef(fit)["shape"])
+  print(paste(colnames(data_returns)[q], specification[p], "   ", VaRTest(0.013, as.numeric(actual), as.numeric(VaR2))[7]))
+  print(paste(colnames(data_returns)[q], specification[p], "   ", VaRTest(0.013, as.numeric(actual), as.numeric(VaR2))[12]))
+  }
+}
+```
+
+
+With out of sample
+
+The fpm method returns the Mean Squared Error (MSE), Mean Absolute Error (MAE), Directional Accuracy (DAC) and number of points used for the calculation (N), of forecast versus realized returns
+
+```{r}
+fit_out_sample <- list()
+out_sample_forecasted <- list()
+horizon=c(30)
+
+for (q in 1:length(data_returns)) {
+    for(p in 1:length(specification)){
+    spec_forecast <- ugarchspec(mean.model=list(armaOrder=c(0,1)),variance.model=list(
+      model = specification[p], garchOrder=c(1,1)), distribution.model='nig')
+    fit_forecast <- ugarchfit(spec=spec_forecast,data= data_returns[,q], solver = "hybrid",
+                     control = list(stationarity = T), out.sample=30) 
+    fitted_forecast<-list(fit_forecast)
+    fit_out_sample<-c(fit_out_sample, fitted_forecast)
+    text<-paste(colnames(data_returns)[q], specification[p])
+    print(paste("Model fit------", text))
+    out_sample_forecast <- ugarchforecast(fit_forecast, n.ahead=30)
+    fit_for<-list(out_sample_forecast)
+    out_sample_forecasted <-c(out_sample_forecasted, fit_for)
+    print(paste("Forecasting------", text))
+}
+}
+
+```
+
+```{r}
+text<-c()
+for (q in 1:length(data_returns)) {
+  for (p in 1:length(specification)) {
+  text<-c(text, paste(colnames(data_returns)[q], specification[p]))
+  }
+}
+
+
+
+tempForecastErrorAll <- data.frame(SelectionCriterion = c("MSE", "MAE", "DAC", "N"))
+
+for (i in 1:c(length(out_sample_forecasted))) {  
+    error <- fpm(out_sample_forecasted[[i]])
+    forecasterror <- as.data.frame(error)
+    colnames(forecasterror) <- text[i] 
+    forecasterror$SelectionCriterion <- row.names(forecasterror)
+    tempForecastErrorAll <- left_join(tempForecastErrorAll, forecasterror, by = "SelectionCriterion")
+}
+```
+
+```{r}
+w<-p*q+1
+r<-w-1
+
+if(ncol(tempForecastErrorAll) ==w) {
+  tempForecastErrorAll[nrow(tempForecastErrorAll)+1, ] <- 0:r  # Directly assign the sequence to a new row
+} else {
+  print(paste("The data frame does not have columns", w))
+}
+
+dfs<-list()
+col_per_df<- p
+for (i in seq(2, ncol(tempForecastErrorAll), by=col_per_df)) {
+  dfs[[length(dfs)+1]]<-tempForecastErrorAll[, i:(i+col_per_df -1)]
+}
+#print(paste("We select the model by MAE for the 30 days forecasting, the commodity and the model is as follows: ", rownames(da)))
+```
+
+
+Write a function, select the minimum MAE, print save the the model names for each commodity. (Three errors: 1. MSE; 2. MAE; 3.DAC)
+```{r}
+select_models<-list()
+select_models_n<-list()
+for (i in seq(1: length(dfs))) {
+    df=as.data.frame(dfs[i])
+    min_index<-which.min(df[2, ])
+    min_value_column<-df[, min_index]
+    da=as.data.frame(min_index)
+    print(paste("We select the model by MAE for the 30 days forecasting, the commodity and the model is as follows: ", rownames(da)))
+    select_models<-c(select_models, rownames(da))
+    select_models_n<-c(select_models_n, min_value_column[5])
+} 
+
+```
+
+
+===========
+Long Memory
+===========
+
+Test for long Memory returns series
+```{r}
+for(q in 1:length(data_returns)) {
+a=c()
+for (i in 1:NROW(data_returns))
+{
+  a=c(a,sum(data_returns[,q][1:i]^2-mean(data_returns[,q]^2)))
+}
+
+stat <- 1/sqrt(NROW(data_returns))*1/sqrt(var(data_returns[,q]^2))*(max(a)-min(a)) #R/S statistic
+
+if(stat < 2.098)print(c("No long memory fail to rejected", stat))
+else{print(c("No long memory rejected", stat))}
+}
+
+```
+
+==================================
+Export Sigma of the Selected Model 
+==================================
+```{r}
+sigma_fits<-data.frame(1:nrow(data_returns))
+
+for (i in 1:length(data_returns)) {
+  a<-select_models_n[[i]]
+  sigma_fit<-as.data.frame(sigma(modelreport[[a]]))
+  colnames(sigma_fit)<-select_models[[i]]
+  sigma_fit$Time<-row.names(sigma_fit)
+  sigma_fits$Time<-row.names(sigma_fit)
+  sigma_fits<-left_join(sigma_fits, sigma_fit, by="Time")
+}
+
+sigma_fits<-sigma_fits[ ,-1]
+```
+
+==================================
+Export VaR of the Selected Model 
+==================================
+
+```{r}
+save.image(file="UnivariateForecasting_jpyDX.RData")
+
+```
